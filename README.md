@@ -2,6 +2,7 @@
 
 Firmware for turning an [M5Stack AtomS3 Lite ESP32-S3 Dev Kit](https://shop.m5stack.com/products/atoms3-lite-esp32s3-dev-kit) plus an [M5Stack PDM MEMS Microphone Unit (SPM1423)](https://shop.m5stack.com/products/pdm-microphone-unit-spm1423?variant=35694843134116) into a small RTSP microphone for [BirdNET-Go](https://github.com/tphakala/birdnet-go), VLC, ffplay, or any client that can consume RTSP/RTP L16 mono PCM.
 
+
 This repository is a fork of [stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic](https://github.com/stedrow/birdnetgo-m5stack-atom-echo-rtsp-mic). The upstream project targets the all-in-one M5Stack Atom Echo / Atom Voice style hardware. This fork is tuned for a two-piece setup: AtomS3 Lite as the ESP32-S3 controller, with the external Unit Mini PDM microphone on the HY2.0-4P connector.
 
 ## Target Hardware
