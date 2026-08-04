@@ -111,6 +111,9 @@ extern uint8_t telemetryCpuLoadPct[];
 extern int16_t telemetryTempDeciC[];
 extern uint16_t telemetryHistoryHead;
 extern uint16_t telemetryHistoryCount;
+extern float lastDhtTempC;
+extern float lastDhtHumidity;
+extern bool lastDhtValid;
 static const uint16_t TELEMETRY_HISTORY_LEN = 120;
 
 struct WebAudioSnapshot {
@@ -926,6 +929,21 @@ static void httpThermal() {
     apiSendJSON(json);
 }
 
+static void httpDht() {
+    String json = "{";
+    json.reserve(120);
+    if (lastDhtValid) {
+        json += "\"temperature_c\":" + String(lastDhtTempC,1) + ",";
+        json += "\"humidity_pct\":" + String(lastDhtHumidity,1) + ",";
+    } else {
+        json += "\"temperature_c\":null,";
+        json += "\"humidity_pct\":null,";
+    }
+    json += "\"valid\":" + String(lastDhtValid?"true":"false");
+    json += "}";
+    apiSendJSON(json);
+}
+
 static bool sampleTemperatureForThermalClear(float &temp) {
     temp = temperatureRead();
     if (isnan(temp) || isinf(temp) || temp < -20.0f || temp > 130.0f) {
@@ -1147,6 +1165,7 @@ void webui_begin() {
     web.on("/api/perf_status", httpPerfStatus);
     web.on("/api/stream_options", httpStreamOptions);
     web.on("/api/thermal", httpThermal);
+    web.on("/api/dht", httpDht);
     web.on("/api/thermal/clear", HTTP_POST, httpThermalClear);
     web.on("/api/logs", httpLogs);
     web.on("/api/action/server_start", HTTP_POST, httpActionServerStart);
