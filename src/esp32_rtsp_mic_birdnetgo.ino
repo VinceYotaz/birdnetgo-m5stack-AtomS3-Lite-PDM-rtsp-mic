@@ -104,6 +104,12 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 #define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
+// -- Pins (WM8782 I2S ADC — ultrasonic bat channel)
+#define I2S_BAT_BCLK_PIN   5   // WM8782 BCLK (G5)
+#define I2S_BAT_LRCLK_PIN  6   // WM8782 LRCLK/WS (G6)
+#define I2S_BAT_DATA_PIN   7   // WM8782 DATA (G7)
+#define DEFAULT_BAT_SAMPLE_RATE 192000
+
 struct CRGB {
     uint8_t r;
     uint8_t g;
@@ -162,6 +168,12 @@ static void sendRTPPacket(RtspSession &session, int16_t* audioData, int numSampl
 static void sendRTPPacketsToActiveSessions(int16_t* audioData, int numSamples);
 static esp_err_t i2sMicRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs);
 // Note: Audio buffers now allocated by Core 1 task
+
+// -- Bat channel I2S state (I2S_NUM_1, standard I2S from WM8782)
+static i2s_chan_handle_t i2sBatRxChannel = NULL;
+volatile bool i2sBatDriverOk = false;
+volatile int32_t i2sBatLastError = ESP_OK;
+uint32_t currentBatSampleRate = DEFAULT_BAT_SAMPLE_RATE;
 
 // -- Global state
 unsigned long audioPacketsSent = 0;
@@ -1308,6 +1320,85 @@ bool restartI2S() {
     // Restart I2S driver
     setup_i2s_driver();
 
+    // I2S setup for WM8782 (bat channel) using ESP-IDF 5 standard I2S RX driver
+    // on I2S_NUM_1. WM8782 outputs signed PCM directly — no unsigned/DC-offset
+    // handling needed, unlike the PDM path.
+    static void shutdownBatI2sDriver() {
+        if (!i2sBatRxChannel) return;
+        esp_err_t err = i2s_channel_disable(i2sBatRxChannel);
+        if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) {
+            simplePrintln("WARNING: Bat I2S channel disable returned " + String(esp_err_to_name(err)));
+        }
+        err = i2s_del_channel(i2sBatRxChannel);
+        if (err != ESP_OK) {
+            simplePrintln("WARNING: Bat I2S channel delete returned " + String(esp_err_to_name(err)));
+        }
+        i2sBatRxChannel = NULL;
+    }
+    
+    bool setup_bat_i2s_driver() {
+        i2sBatDriverOk = false;
+        i2sBatLastError = ESP_OK;
+        shutdownBatI2sDriver();
+    
+        i2s_chan_config_t chanConfig = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+        chanConfig.dma_desc_num = 8;
+        chanConfig.dma_frame_num = 256;
+    
+        esp_err_t err = i2s_new_channel(&chanConfig, NULL, &i2sBatRxChannel);
+        if (err != ESP_OK) {
+            i2sBatLastError = err;
+            simplePrintln("ERROR: Bat I2S new_channel failed: " + String(esp_err_to_name(err)));
+            i2sBatRxChannel = NULL;
+            return false;
+        }
+    
+        i2s_std_config_t stdConfig = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(currentBatSampleRate),
+            .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = I2S_GPIO_UNUSED,
+                .bclk = (gpio_num_t)I2S_BAT_BCLK_PIN,
+                .ws   = (gpio_num_t)I2S_BAT_LRCLK_PIN,
+                .dout = I2S_GPIO_UNUSED,
+                .din  = (gpio_num_t)I2S_BAT_DATA_PIN,
+                .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
+            }
+        };
+        // WM8782 is a stereo ADC, but we only need one channel — take the left slot.
+        stdConfig.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
+    
+        err = i2s_channel_init_std_mode(i2sBatRxChannel, &stdConfig);
+        if (err != ESP_OK) {
+            i2sBatLastError = err;
+            simplePrintln("ERROR: Bat I2S std init failed: " + String(esp_err_to_name(err)));
+            shutdownBatI2sDriver();
+            return false;
+        }
+    
+        err = i2s_channel_enable(i2sBatRxChannel);
+        if (err != ESP_OK) {
+            i2sBatLastError = err;
+            simplePrintln("ERROR: Bat I2S channel enable failed: " + String(esp_err_to_name(err)));
+            shutdownBatI2sDriver();
+            return false;
+        }
+    
+        i2sBatDriverOk = true;
+        i2sBatLastError = ESP_OK;
+        simplePrintln("Bat I2S ready (WM8782 std RX): " + String(currentBatSampleRate) + "Hz, pins BCLK=" +
+                      String(I2S_BAT_BCLK_PIN) + " LRCLK=" + String(I2S_BAT_LRCLK_PIN) + " DATA=" + String(I2S_BAT_DATA_PIN));
+        return true;
+    }
+    
+    static esp_err_t i2sBatRead(void* dest, size_t size, size_t* bytesRead, uint32_t timeoutMs) {
+        if (!i2sBatRxChannel) {
+            if (bytesRead) *bytesRead = 0;
+            return ESP_ERR_INVALID_STATE;
+        }
+        return i2s_channel_read(i2sBatRxChannel, dest, size, bytesRead, timeoutMs);
+    }
+    
     // Refresh HPF with current parameters
     updateHighpassCoeffs();
     maxPacketRate = 0;
@@ -3058,6 +3149,15 @@ void setup() {
 
     Serial.println("Setting up I2S driver...");
     setup_i2s_driver();
+
+    Serial.println("Setting up bat I2S driver (WM8782)...");
+    if (setup_bat_i2s_driver()) {
+        Serial.println("Bat I2S driver ready");
+    } else {
+        Serial.printf("Bat I2S driver setup failed (err=%ld) — hardware not connected yet?\n", (long)i2sBatLastError);
+    }
+
+    
     if (i2sDriverOk) {
         Serial.println("I2S driver ready");
         Serial.println("Updating highpass coefficients...");
