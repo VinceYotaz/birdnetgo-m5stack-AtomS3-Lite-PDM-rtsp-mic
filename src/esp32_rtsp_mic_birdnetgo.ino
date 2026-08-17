@@ -3164,10 +3164,10 @@ void loop() {
         recordTelemetrySample(audioPipelineLoadPct, lastTemperatureC, lastTemperatureValid);
         lastTelemetrySampleMs = millis();
     }
-    if (millis() - lastDhtCheck > 30000) { // 30 s — DHT22 ne supporte pas les lectures trop fréquentes
-        checkDht();
-        lastDhtCheck = millis();
-    }
+    //if (millis() - lastDhtCheck > 30000) { // 30 s — DHT22 ne supporte pas les lectures trop fréquentes
+    //    checkDht();
+    //    lastDhtCheck = millis();
+    //}
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)
     if (millis() - lastMemoryCheck > 600000) { // 10 min
