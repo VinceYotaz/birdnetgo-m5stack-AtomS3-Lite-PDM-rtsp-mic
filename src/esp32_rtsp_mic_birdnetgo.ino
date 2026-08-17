@@ -1,4 +1,3 @@
-#include <DHT.h>
 #include <WiFi.h>
 #include <WiFiManager.h>
 #include <WiFiUdp.h>
@@ -103,8 +102,6 @@ static const uint32_t SUPPORTED_PDM_SAMPLE_RATES[] = {16000, 24000, 32000, 48000
 // M5's reference wiring for the PDM Unit is CLK=G1 and DATA=G2.
 #define I2S_CLK_PIN      1  // PDM CLK (G1)
 #define I2S_DATA_IN_PIN  2  // PDM DATA (G2)
-#define DHT_PIN 5           // DHT22 DATA (G5, libre — ne pas utiliser G1/G2, pris par le micro)
-#define DHT_TYPE DHT22
 #define WS2812_LED_PIN  35  // AtomS3 Lite built-in RGB LED
 
 struct CRGB {
@@ -354,11 +351,6 @@ String describeResetReason(esp_reset_reason_t reason) {
     }
 }
 
-DHT dht(DHT_PIN, DHT_TYPE);
-float lastDhtTempC = NAN;
-float lastDhtHumidity = NAN;
-bool lastDhtValid = false;
-unsigned long lastDhtCheck = 0;
 bool overheatProtectionEnabled = DEFAULT_OVERHEAT_PROTECTION;
 float overheatShutdownC = (float)DEFAULT_OVERHEAT_LIMIT_C;
 bool overheatLockoutActive = false;
@@ -847,19 +839,6 @@ void checkTemperature() {
         simplePrintln("WARNING: High temperature detected (" + String(temp, 1) + " C). Approaching shutdown limit.");
         lastTempWarn = millis();
     }
-}
-
-// DHT22 environmental sensor monitoring
-void checkDht() {
-    float h = dht.readHumidity();
-    float t = dht.readTemperature();
-    if (isnan(h) || isnan(t)) {
-        lastDhtValid = false;
-        return;
-    }
-    lastDhtTempC = t;
-    lastDhtHumidity = h;
-    lastDhtValid = true;
 }
 
 // Performance diagnostics
@@ -3007,8 +2986,6 @@ void setup() {
     Serial.println("Random seed initialized");
     lastResetReasonStr = describeResetReason(esp_reset_reason());
     simplePrintln("Boot reason: " + lastResetReasonStr);
-    dht.begin();
-    Serial.println("DHT22 sensor initialized");
     
     // Enable external antenna (for XIAO ESP32-C6).
     // NOTE: Commented out for M5Stack STAMP S3 - no external antenna control needed
@@ -3164,10 +3141,6 @@ void loop() {
         recordTelemetrySample(audioPipelineLoadPct, lastTemperatureC, lastTemperatureValid);
         lastTelemetrySampleMs = millis();
     }
-    //if (millis() - lastDhtCheck > 30000) { // 30 s — DHT22 ne supporte pas les lectures trop fréquentes
-    //    checkDht();
-    //    lastDhtCheck = millis();
-    //}
 
     // Heap monitoring (every 10 minutes — useful for detecting leaks in long deployments)
     if (millis() - lastMemoryCheck > 600000) { // 10 min
