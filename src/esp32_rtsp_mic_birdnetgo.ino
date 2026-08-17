@@ -336,6 +336,24 @@ unsigned long lastI2SReset = 0;
 float maxTemperature = 0.0f;
 float lastTemperatureC = 0.0f;
 bool lastTemperatureValid = false;
+
+#include <esp_system.h>
+String lastResetReasonStr = "";
+
+String describeResetReason(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON: return "power-on";
+        case ESP_RST_SW: return "software reset";
+        case ESP_RST_PANIC: return "PANIC (crash logiciel)";
+        case ESP_RST_INT_WDT: return "watchdog interruption";
+        case ESP_RST_TASK_WDT: return "watchdog task";
+        case ESP_RST_WDT: return "watchdog autre";
+        case ESP_RST_BROWNOUT: return "BROWNOUT (sous-tension)";
+        case ESP_RST_DEEPSLEEP: return "réveil deep-sleep";
+        default: return "raison inconnue (" + String((int)reason) + ")";
+    }
+}
+
 DHT dht(DHT_PIN, DHT_TYPE);
 float lastDhtTempC = NAN;
 float lastDhtHumidity = NAN;
@@ -2987,6 +3005,8 @@ void setup() {
 
     bootTime = millis(); // Store boot time
     Serial.println("Random seed initialized");
+    lastResetReasonStr = describeResetReason(esp_reset_reason());
+    simplePrintln("Boot reason: " + lastResetReasonStr);
     dht.begin();
     Serial.println("DHT22 sensor initialized");
     
