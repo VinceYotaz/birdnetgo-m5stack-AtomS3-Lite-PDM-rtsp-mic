@@ -114,6 +114,7 @@ extern uint16_t telemetryHistoryCount;
 extern float lastDhtTempC;
 extern float lastDhtHumidity;
 extern bool lastDhtValid;
+extern String lastResetReasonStr;
 static const uint16_t TELEMETRY_HISTORY_LEN = 120;
 
 struct WebAudioSnapshot {
@@ -658,6 +659,7 @@ static void httpStatus() {
     json += "\"rtsp_rejected_clients\":" + String(rtspRejectedClientCount) + ",";
     json += "\"stream_formats\":\"RTSP/RTP L16, HTTP L16, AIFF PCM, WebAudio PCM, WAV PCM chunk, JSON PCM\",";
     json += "\"multi_client_policy\":\"bounded_multi_rtsp_tcp\",";
+    json += "\"last_reset_reason\":\"" + jsonEscape(lastResetReasonStr) + "\",";
     json += "\"hardware_profile\":\"" + jsonEscape(describeHardwareProfile()) + "\"";
     json += "}";
     apiSendJSON(json);
