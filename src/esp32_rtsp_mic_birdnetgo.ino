@@ -3588,6 +3588,20 @@ void setup() {
         rtspServerEnabled = false;
         rtspServer.stop();
     }
+
+    if (!overheatLatched && i2sBatDriverOk) {
+        batRtspServer.begin();
+        batRtspServer.setNoDelay(true);
+        batRtspServerEnabled = true;
+        simplePrintln("Bat RTSP server ready on port 8555");
+        simplePrintln("Bat RTSP URL: rtsp://" + WiFi.localIP().toString() + ":8555/audio");
+    } else {
+        batRtspServerEnabled = false;
+        if (!i2sBatDriverOk) {
+            simplePrintln("Bat RTSP server not started: WM8782 driver not ready");
+        }
+    }    
+    
     if (i2sDriverOk && rtspServerEnabled) {
         if (startAudioCaptureTask()) {
             Serial.println("Dual-core audio ready (Core 1 pipeline running for live diagnostics)");
@@ -3770,6 +3784,75 @@ void loop() {
             }
         }
     }
+
+    // Bat RTSP client management (Core 0) — mirrors the bird RTSP logic above
+    static bool wasBatStreaming = false;
+    if (batRtspServerEnabled) {
+        if (wasBatStreaming && !batIsStreaming) {
+            unsigned long sessionSec = (millis() - lastBatRtspPlayMs) / 1000;
+            simplePrintln("Bat RTSP client disconnected (session: " + String(sessionSec) + "s, dropped: " +
+                         String(batAudioPacketsDropped) + ")");
+        }
+        wasBatStreaming = batIsStreaming;
+
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            RtspSession &session = batRtspSessions[i];
+            if (session.occupied && !session.streaming) {
+                if (!session.client || !session.client.connected()) {
+                    closeBatRtspSession(session, false);
+                } else if (millis() - session.lastActivity > 60000) {
+                    simplePrintln("Bat RTSP idle timeout — disconnecting " + session.remoteAddr);
+                    closeBatRtspSession(session, true);
+                }
+            }
+        }
+
+        WiFiClient newBatClient = batRtspServer.accept();
+        if (newBatClient) {
+            int slot = findFreeBatRtspSession();
+            if (slot < 0) {
+                rejectBusyRtspClient(newBatClient);
+            } else {
+                RtspSession &session = batRtspSessions[slot];
+                session.client = newBatClient;
+                session.client.setNoDelay(true);
+                session.occupied = true;
+                session.streaming = false;
+                session.setupDone = false;
+                session.sessionId = "";
+                session.remoteAddr = session.client.remoteIP().toString();
+                session.transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+                session.rtpSequence = 0;
+                session.rtpTimestamp = 0;
+                session.rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
+                session.connectedAt = millis();
+                session.lastActivity = millis();
+                session.playStartedAt = 0;
+                session.parseBufferPos = 0;
+                simplePrintln("New bat RTSP client connected: " + session.remoteAddr);
+            }
+        }
+
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            RtspSession &session = batRtspSessions[i];
+            if (session.occupied && !session.streaming) {
+                processBatRTSP(session);
+            }
+        }
+    } else if (batIsStreaming) {
+        batStopStreamRequested = true;
+        if (batAudioTaskRunning) {
+            if (!stopBatAudioCaptureTask()) {
+                simplePrintln("Bat server disable: audio task did not stop cleanly");
+            }
+        }
+        for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+            if (batRtspSessions[i].occupied && !batRtspSessions[i].streaming) {
+                closeBatRtspSession(batRtspSessions[i], true);
+            }
+        }
+    }
+    
     // Handle deferred reboot/reset safely here
     if (scheduledRebootAt != 0 && millis() >= scheduledRebootAt) {
         if (scheduledFactoryReset) {
