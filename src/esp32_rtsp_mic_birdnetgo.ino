@@ -176,6 +176,20 @@ volatile bool i2sBatDriverOk = false;
 volatile int32_t i2sBatLastError = ESP_OK;
 uint32_t currentBatSampleRate = DEFAULT_BAT_SAMPLE_RATE;
 
+// -- Bat RTSP server (separate port, separate session pool)
+WiFiServer batRtspServer(8555);
+bool batRtspServerEnabled = true;
+static RtspSession batRtspSessions[MAX_RTSP_CLIENTS];
+volatile bool batIsStreaming = false;
+TaskHandle_t batAudioCaptureTaskHandle = NULL;
+volatile bool batAudioTaskRunning = false;
+volatile bool batStopStreamRequested = false;
+volatile bool batStreamCleanupDone = false;
+unsigned long batAudioPacketsSent = 0;
+unsigned long batAudioPacketsDropped = 0;
+unsigned long batAudioBlocksSent = 0;
+unsigned long lastBatRtspPlayMs = 0;
+
 // -- Global state
 unsigned long audioPacketsSent = 0;
 unsigned long audioPacketsDropped = 0;  // Track dropped frames
