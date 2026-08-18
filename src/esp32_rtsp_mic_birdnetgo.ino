@@ -2951,6 +2951,403 @@ void handleRTSPCommand(RtspSession &session, const String &request) {
     }
 }
 
+// ================== BAT RTSP HANDLING (passthrough, no DSP) ==================
+static bool startBatAudioCaptureTask();
+static bool stopBatAudioCaptureTask();
+
+static void updateBatStreamingStateFromSessions() {
+    bool anyStreaming = false;
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (batRtspSessions[i].occupied && batRtspSessions[i].streaming) {
+            anyStreaming = true;
+            break;
+        }
+    }
+    batIsStreaming = anyStreaming;
+}
+
+static void closeBatRtspSession(RtspSession &session, bool stopClient) {
+    if (stopClient && session.client) {
+        session.client.stop();
+    }
+    session.occupied = false;
+    session.streaming = false;
+    session.setupDone = false;
+    session.sessionId = "";
+    session.remoteAddr = "";
+    session.rtpSequence = 0;
+    session.rtpTimestamp = 0;
+    session.rtpSSRC = 0;
+    session.connectedAt = 0;
+    session.lastActivity = 0;
+    session.playStartedAt = 0;
+    session.parseBufferPos = 0;
+    updateBatStreamingStateFromSessions();
+}
+
+static int findFreeBatRtspSession() {
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (!batRtspSessions[i].occupied) return i;
+    }
+    return -1;
+}
+
+void handleBatRTSPCommand(RtspSession &session, const String &request) {
+    WiFiClient &client = session.client;
+    int cseqVal = parseRtspCSeqValue(request.c_str());
+    String cseq = String(cseqVal);
+
+    session.lastActivity = millis();
+
+    if (rtspMethodIs(request.c_str(), "OPTIONS")) {
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER, SET_PARAMETER\r\n\r\n");
+
+    } else if (rtspMethodIs(request.c_str(), "DESCRIBE")) {
+        String ip = WiFi.localIP().toString();
+        String sdp = "v=0\r\n";
+        sdp += "o=- 0 0 IN IP4 " + ip + "\r\n";
+        sdp += "s=ESP32 RTSP Bat Mic (" + String(currentBatSampleRate) + "Hz, 16-bit PCM)\r\n";
+        sdp += "c=IN IP4 " + ip + "\r\n";
+        sdp += "t=0 0\r\n";
+        sdp += "m=audio 0 RTP/AVP 96\r\n";
+        sdp += "a=rtpmap:96 L16/" + String(currentBatSampleRate) + "/1\r\n";
+        sdp += "a=control:track1\r\n";
+
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Content-Type: application/sdp\r\n");
+        client.print("Content-Base: rtsp://" + ip + ":8555/audio/\r\n");
+        client.print("Content-Length: " + String(sdp.length()) + "\r\n\r\n");
+        client.print(sdp);
+
+    } else if (rtspMethodIs(request.c_str(), "SETUP")) {
+        if (session.sessionId.length() == 0) {
+            session.sessionId = String(random(100000000, 999999999));
+        }
+        if (session.rtpSSRC == 0) {
+            session.rtpSSRC = (uint32_t)random(1, 0x7FFFFFFF);
+        }
+        session.transport = RTSP_TRANSPORT_TCP_INTERLEAVED;
+
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Session: " + session.sessionId + ";timeout=86400\r\n");
+        client.print("Transport: RTP/AVP/TCP;unicast;interleaved=0-1;mode=\"PLAY\";ssrc=" +
+                     String(session.rtpSSRC, HEX) + "\r\n\r\n");
+        session.setupDone = true;
+        simplePrintln("BAT RTSP SETUP for " + session.remoteAddr);
+
+    } else if (rtspMethodIs(request.c_str(), "PLAY")) {
+        if (!session.setupDone) {
+            client.print("RTSP/1.0 455 Method Not Valid in This State\r\n");
+            client.print("CSeq: " + cseq + "\r\n\r\n");
+            return;
+        }
+        if (!i2sBatDriverOk) {
+            client.print("RTSP/1.0 503 Service Unavailable\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: close\r\n\r\n");
+            simplePrintln("BAT PLAY rejected: I2S bat driver not ready");
+            delay(5);
+            client.stop();
+            return;
+        }
+
+        session.rtpSequence = 0;
+        session.rtpTimestamp = 0;
+        if (batAudioCaptureTaskHandle == NULL && !startBatAudioCaptureTask()) {
+            client.print("RTSP/1.0 503 Service Unavailable\r\n");
+            client.print("CSeq: " + cseq + "\r\n");
+            client.print("Connection: close\r\n\r\n");
+            simplePrintln("BAT PLAY rejected: audio task could not start");
+            delay(5);
+            closeBatRtspSession(session, true);
+            return;
+        }
+        lastBatRtspPlayMs = millis();
+
+        String playUrl = "rtsp://" + WiFi.localIP().toString() + ":8555/audio/track1";
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Session: " + session.sessionId + "\r\n");
+        client.print("Range: npt=0.000-\r\n");
+        client.print("RTP-Info: url=" + playUrl + ";seq=0;rtptime=0\r\n\r\n");
+
+        session.streaming = true;
+        session.playStartedAt = millis();
+        updateBatStreamingStateFromSessions();
+        simplePrintln("BAT STREAMING STARTED for " + session.remoteAddr);
+
+    } else if (rtspMethodIs(request.c_str(), "TEARDOWN")) {
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n");
+        client.print("Session: " + session.sessionId + "\r\n\r\n");
+        closeBatRtspSession(session, true);
+        simplePrintln("BAT STREAMING STOPPED");
+
+    } else if (rtspMethodIs(request.c_str(), "GET_PARAMETER")) {
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else if (rtspMethodIs(request.c_str(), "SET_PARAMETER")) {
+        client.print("RTSP/1.0 200 OK\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
+    } else {
+        client.print("RTSP/1.0 405 Method Not Allowed\r\n");
+        client.print("CSeq: " + cseq + "\r\n\r\n");
+    }
+}
+
+// RTSP negotiation for bat sessions not yet handed to Core 1
+void processBatRTSP(RtspSession &session) {
+    WiFiClient &client = session.client;
+    if (!client.connected()) return;
+
+    if (client.available()) {
+        int available = client.available();
+        int spaceLeft = (int)sizeof(session.parseBuffer) - session.parseBufferPos - 1;
+        if (available > spaceLeft) available = spaceLeft;
+        if (available <= 0) {
+            client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+            closeBatRtspSession(session, true);
+            return;
+        }
+
+        int readBytes = client.read(session.parseBuffer + session.parseBufferPos, available);
+        if (readBytes <= 0) return;
+        session.parseBufferPos += readBytes;
+        session.parseBuffer[session.parseBufferPos] = '\0';
+
+        char* endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
+        while (endOfHeader != nullptr) {
+            int headerLen = (endOfHeader - (char*)session.parseBuffer) + 4;
+            uint16_t bodyBytes = parseRtspContentLengthValue((char*)session.parseBuffer);
+            int totalMessageLen = headerLen + (int)bodyBytes;
+            if (totalMessageLen >= (int)sizeof(session.parseBuffer)) {
+                client.print("RTSP/1.0 413 Request Entity Too Large\r\nConnection: close\r\n\r\n");
+                closeBatRtspSession(session, true);
+                return;
+            }
+            if (session.parseBufferPos < totalMessageLen) return;
+
+            *endOfHeader = '\0';
+            String request = String((char*)session.parseBuffer);
+            handleBatRTSPCommand(session, request);
+            if (!session.occupied || session.streaming) return;
+
+            int remaining = session.parseBufferPos - totalMessageLen;
+            if (remaining > 0) {
+                memmove(session.parseBuffer, session.parseBuffer + totalMessageLen, remaining);
+            }
+            session.parseBufferPos = max(0, remaining);
+            session.parseBuffer[session.parseBufferPos] = '\0';
+            endOfHeader = strstr((char*)session.parseBuffer, "\r\n\r\n");
+        }
+    }
+}
+
+// ================== BAT AUDIO PIPELINE (Core 1, passthrough) ==================
+// No HPF/AGC/noise suppression — WM8782 delivers clean signed PCM directly.
+// Kept deliberately simple: read → RTP send. No DC tracking needed.
+
+static const uint16_t BAT_READ_BUFFER_SAMPLES = 512; // ~2.7ms per block @ 192kHz
+static SemaphoreHandle_t batTaskExitSemaphore = NULL;
+
+static void sendBatRTPPacket(RtspSession &session, int16_t* audioData, int numSamples) {
+    WiFiClient &client = session.client;
+    if (!client.connected()) {
+        closeBatRtspSession(session, true);
+        return;
+    }
+
+    const int maxSamplesPerPacket = 1024;
+    int offsetSamples = 0;
+    while (offsetSamples < numSamples) {
+        const int packetSamples = min(maxSamplesPerPacket, numSamples - offsetSamples);
+        const uint16_t payloadSize = (uint16_t)(packetSamples * (int)sizeof(int16_t));
+        const uint16_t packetSize = (uint16_t)(12 + payloadSize);
+        const unsigned long blockMs = max(1UL, (unsigned long)(((uint32_t)packetSamples * 1000UL) / max((uint32_t)1, currentBatSampleRate)));
+        const unsigned long packetWindowMs = max(40UL, min(140UL, blockMs * 2UL));
+        uint8_t packetBuffer[4 + 12 + (1024 * sizeof(int16_t))];
+
+        packetBuffer[0] = 0x24;
+        packetBuffer[1] = 0x00;
+        packetBuffer[2] = (uint8_t)((packetSize >> 8) & 0xFF);
+        packetBuffer[3] = (uint8_t)(packetSize & 0xFF);
+        uint8_t* rtp = packetBuffer + 4;
+        rtp[0] = 0x80;
+        rtp[1] = 96;
+        rtp[2] = (uint8_t)((session.rtpSequence >> 8) & 0xFF);
+        rtp[3] = (uint8_t)(session.rtpSequence & 0xFF);
+        rtp[4] = (uint8_t)((session.rtpTimestamp >> 24) & 0xFF);
+        rtp[5] = (uint8_t)((session.rtpTimestamp >> 16) & 0xFF);
+        rtp[6] = (uint8_t)((session.rtpTimestamp >> 8) & 0xFF);
+        rtp[7] = (uint8_t)(session.rtpTimestamp & 0xFF);
+        rtp[8]  = (uint8_t)((session.rtpSSRC >> 24) & 0xFF);
+        rtp[9]  = (uint8_t)((session.rtpSSRC >> 16) & 0xFF);
+        rtp[10] = (uint8_t)((session.rtpSSRC >> 8) & 0xFF);
+        rtp[11] = (uint8_t)(session.rtpSSRC & 0xFF);
+
+        const int16_t* packetAudio = audioData + offsetSamples;
+        for (int i = 0; i < packetSamples; ++i) {
+            uint16_t s = (uint16_t)packetAudio[i];
+            rtp[12 + (i * 2)] = (uint8_t)((s >> 8) & 0xFF);
+            rtp[12 + (i * 2) + 1] = (uint8_t)(s & 0xFF);
+        }
+
+        bool success = writeAll(client, packetBuffer, (size_t)packetSize + 4U, packetWindowMs);
+        if (success) {
+            session.rtpSequence++;
+            session.rtpTimestamp += (uint32_t)packetSamples;
+            batAudioPacketsSent++;
+            offsetSamples += packetSamples;
+        } else {
+            batAudioPacketsDropped++;
+            closeBatRtspSession(session, true);
+            return;
+        }
+    }
+}
+
+static void sendBatRTPPacketsToActiveSessions(int16_t* audioData, int numSamples) {
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (batRtspSessions[i].occupied && batRtspSessions[i].streaming) {
+            sendBatRTPPacket(batRtspSessions[i], audioData, numSamples);
+        }
+    }
+}
+
+void batAudioCaptureTask(void* parameter) {
+    Serial.println("[Core1-Bat] Bat audio pipeline task started");
+    batAudioTaskRunning = true;
+
+    size_t bytesRead = 0;
+    int16_t* captureBuffer = (int16_t*)malloc(BAT_READ_BUFFER_SAMPLES * sizeof(int16_t));
+    if (!captureBuffer) {
+        Serial.println("[Core1-Bat] FATAL: Failed to allocate bat audio buffer!");
+        batAudioTaskRunning = false;
+        batAudioCaptureTaskHandle = NULL;
+        if (batTaskExitSemaphore != NULL) xSemaphoreGive(batTaskExitSemaphore);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    unsigned long lastStatsLog = millis();
+    uint32_t i2sErrors = 0;
+    uint32_t packetCount = 0;
+    const uint32_t readTimeoutMs = 30;
+
+    while (batAudioTaskRunning) {
+        if (batStopStreamRequested) {
+            for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+                if (batRtspSessions[i].occupied && batRtspSessions[i].streaming) {
+                    closeBatRtspSession(batRtspSessions[i], true);
+                }
+            }
+            updateBatStreamingStateFromSessions();
+            batStreamCleanupDone = true;
+            crossCoreMemoryBarrier();
+            while (batStopStreamRequested && batAudioTaskRunning) {
+                vTaskDelay(pdMS_TO_TICKS(10));
+            }
+            continue;
+        }
+
+        bool streamActive = batIsStreaming;
+
+        if (millis() - lastStatsLog > 30000) {
+            Serial.printf("[Core1-Bat] Sent=%u I2Serr=%u\n", packetCount, i2sErrors);
+            lastStatsLog = millis();
+        }
+
+        esp_err_t result = i2sBatRead(captureBuffer, BAT_READ_BUFFER_SAMPLES * sizeof(int16_t),
+                                       &bytesRead, readTimeoutMs);
+
+        if (result != ESP_OK || bytesRead == 0) {
+            i2sErrors++;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        uint16_t samplesRead = bytesRead / sizeof(int16_t);
+
+        if (streamActive) {
+            sendBatRTPPacketsToActiveSessions(captureBuffer, samplesRead);
+            batAudioBlocksSent++;
+            packetCount++;
+        }
+
+        static unsigned long lastBatRtspCheck = 0;
+        if (streamActive && (millis() - lastBatRtspCheck > 50)) {
+            lastBatRtspCheck = millis();
+            for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+                if (batRtspSessions[i].occupied && batRtspSessions[i].streaming) {
+                    pollStreamingRtspCommands(batRtspSessions[i]);
+                }
+            }
+        }
+
+        taskYIELD();
+    }
+
+    free(captureBuffer);
+    batAudioTaskRunning = false;
+    batAudioCaptureTaskHandle = NULL;
+    Serial.println("[Core1-Bat] Bat audio pipeline task stopped");
+    if (batTaskExitSemaphore != NULL) xSemaphoreGive(batTaskExitSemaphore);
+    vTaskDelete(NULL);
+}
+
+static bool startBatAudioCaptureTask() {
+    if (batAudioCaptureTaskHandle != NULL) return true;
+
+    if (batTaskExitSemaphore == NULL) {
+        batTaskExitSemaphore = xSemaphoreCreateBinary();
+    }
+    while (batTaskExitSemaphore != NULL && xSemaphoreTake(batTaskExitSemaphore, 0) == pdTRUE) {}
+
+    BaseType_t result = xTaskCreatePinnedToCore(
+        batAudioCaptureTask,
+        "BatAudioPipeline",
+        8192,
+        NULL,
+        10,
+        &batAudioCaptureTaskHandle,
+        1
+    );
+
+    if (result != pdPASS) {
+        simplePrintln("[Core1-Bat] FATAL: Failed to create bat audio task!");
+        batAudioCaptureTaskHandle = NULL;
+        batAudioTaskRunning = false;
+        return false;
+    }
+    return true;
+}
+
+static bool stopBatAudioCaptureTask() {
+    if (batAudioCaptureTaskHandle == NULL) return true;
+
+    batAudioTaskRunning = false;
+    crossCoreMemoryBarrier();
+    bool exited = (batTaskExitSemaphore != NULL &&
+                   xSemaphoreTake(batTaskExitSemaphore, pdMS_TO_TICKS(2000)) == pdTRUE);
+    if (!exited) {
+        Serial.println("[Core0] WARNING: Bat audio task did not exit within 2s");
+        return false;
+    }
+
+    batAudioCaptureTaskHandle = NULL;
+    for (uint8_t i = 0; i < MAX_RTSP_CLIENTS; ++i) {
+        if (batRtspSessions[i].occupied && batRtspSessions[i].streaming) {
+            closeBatRtspSession(batRtspSessions[i], true);
+        }
+    }
+    updateBatStreamingStateFromSessions();
+    return true;
+}
+
 // RTSP processing for sessions that are still owned by Core 0.
 void processRTSP(RtspSession &session) {
     WiFiClient &client = session.client;
